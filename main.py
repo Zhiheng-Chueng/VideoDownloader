@@ -2,19 +2,21 @@ import customtkinter as ctk
 import threading
 import os
 from core.manager import DownloadManager
+from handlers.generic_hls_handler import GenericHLSHandler
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("多平台视频下载器 (格式选择版)")
         self.geometry("700x600")
+        self.last_info = None  # <--- 加上这一行！防止还没解析就点下载导致报错
         
         self.manager = DownloadManager()
         self.save_dir = "downloads"
         os.makedirs(self.save_dir, exist_ok=True)
         self.current_url = ""
-        self.selected_format = ctk.StringVar(value="best") # 默认值为 best
-
+        self.selected_format = ctk.StringVar(value="best")
+        self.format_url_map = {} # <--- 新增：用来映射 格式ID -> 真实m3u8链接
         self.setup_ui()
 
     def setup_ui(self):
@@ -66,8 +68,17 @@ class App(ctk.CTk):
         threading.Thread(target=self.run_parse, args=(url,), daemon=True).start()
 
     def run_parse(self, url):
-        info = self.manager.get_info(url)
-        self.after(0, self.update_options_ui, info)
+        try:
+            self.log_to_ui(f"🔍 正在解析: {url}")
+            info = self.manager.get_info(url)
+            
+            if info:
+                self.last_info = info  # <--- 重点！把解析到的 Headers/Cookies 存起来
+                self.after(0, lambda: self.update_options_ui(info))
+            else:
+                self.log_to_ui("❌ 未能获取视频信息。")
+        except Exception as e:
+            self.log_to_ui(f"💥 解析崩溃: {str(e)}")
 
     def update_options_ui(self, info):
         self.parse_btn.configure(state="normal", text="1. 重新解析")
@@ -91,6 +102,12 @@ class App(ctk.CTk):
                 fid = f.get('format_id', '')
                 # 如果既有视频又有音频，使用 {fid}；如果只有视频，通常需要配合最佳音频 bestaudio 下载，yt-dlp 语法为 {fid}+bestaudio
                 dl_id = fid if f.get('acodec') != 'none' else f"{fid}+bestaudio"
+                
+                # ---> 新增：提取真实的底层流媒体链接（可能就是 .m3u8）
+                real_url = f.get('url', '') 
+                self.format_url_map[dl_id] = real_url
+                # <---
+                
                 text = f"[{ext}] {res} {note} (ID: {fid})"
                 ctk.CTkRadioButton(self.options_frame, text=text, variable=self.selected_format, value=dl_id).pack(anchor="w", pady=2, padx=10)
 
@@ -107,17 +124,73 @@ class App(ctk.CTk):
         # 启用下载按钮
         self.download_btn.configure(state="normal")
 
-    # ================= 下载流程 =================
+    # ================= 下载流程 (指挥部) =================
     def on_download_click(self):
         fid = self.selected_format.get()
         self.download_btn.configure(state="disabled", text="下载中...")
-        self.log_to_ui(f"\n--- 开始执行下载任务 (参数: {fid}) ---")
+        self.log_to_ui(f"\n--- 启动任务: {fid} ---")
         
-        threading.Thread(target=self.run_download, args=(self.current_url, fid), daemon=True).start()
+        # 提取真实地址 (可能是 .m3u8 直链)
+        real_url = self.format_url_map.get(fid, self.current_url)
+        
+        # 开启后台线程，防止 GUI 卡死
+        threading.Thread(
+            target=self.run_download, 
+            args=(self.current_url, fid, real_url), 
+            daemon=True
+        ).start()
 
-    def run_download(self, url, fid):
-        self.manager.start_download(url, self.save_dir, fid, self.log_to_ui)
-        self.after(0, lambda: self.download_btn.configure(state="normal", text="3. 开始下载"))
+    def run_download(self, original_url, fid, real_url):
+        try:
+            is_hls = ".m3u8" in real_url or "hls" in fid.lower()
+            
+            if is_hls:
+                hls_handler = None
+                for h in self.manager.handlers:
+                    if h.__class__.__name__ == "GenericHLSHandler":
+                        hls_handler = h
+                        break
+                
+                if hls_handler:
+                   # --- 新增：强制注入原始网页作为 Referer (关键破解 404) ---
+                    try:
+                        origin = "/".join(original_url.split("/")[:3])
+                        hls_handler.session.headers.update({
+                            'Referer': original_url,
+                            'Origin': origin
+                        })
+                        self.log_to_ui(f"🧪 注入来源伪装: {origin}")
+                    except:
+                        pass
+                    # -----------------------------------------------------
+
+                    # ✅ 安全检查：确保 last_info 存在且有数据
+                    if self.last_info and isinstance(self.last_info, dict):
+                        headers = self.last_info.get('http_headers', {})
+                        hls_handler.session.headers.update(headers)
+                        
+                        # 同步 Cookie
+                        cookies = self.last_info.get('cookies')
+                        if cookies:
+                            hls_handler.session.headers.update({'Cookie': cookies})
+                            
+                        self.log_to_ui("✅ 鉴权情报同步成功，准备强攻...")
+                    
+                    # 4. 移交任务
+                    self.manager.start_download(real_url, self.save_dir, fid, self.log_to_ui)
+                else:
+                    self.log_to_ui("⚠️ 未找到 HLS 处理器，尝试回退至通用模式...")
+                    self.manager.start_download(original_url, self.save_dir, fid, self.log_to_ui)
+            
+            else:
+                # 5. 普通任务直接走管理器分发
+                self.manager.start_download(original_url, self.save_dir, fid, self.log_to_ui)
+
+        except Exception as e:
+            self.log_to_ui(f"❌ 下载调度崩溃: {str(e)}")
+        finally:
+            # 恢复按钮状态
+            self.after(0, lambda: self.download_btn.configure(state="normal", text="3. 开始下载"))
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("System")
