@@ -1,0 +1,14 @@
+# 核心下载引擎
+yt-dlp>=2024.3.10
+
+# UI 框架 (如果你使用的是之前建议的 CustomTkinter)
+customtkinter>=5.2.2
+packaging>=23.2
+
+# 网络请求与解析 (用于编写自定义 Handler)
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.1.0
+
+# 环境变量管理 (可选，用于存储 API Key 或配置)
+python-dotenv>=1.0.1
