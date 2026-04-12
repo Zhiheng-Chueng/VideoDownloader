@@ -1,5 +1,9 @@
 import os
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 import m3u8
 from urllib.parse import urljoin, urlparse
@@ -31,7 +35,7 @@ class GenericHLSHandler:
         def log(msg):
             if log_callback: log_callback(msg)
 
-    # 1. 动态伪装 (如果 main.py 没传，我们就用当前 m3u8 域名保底)
+        # 1. 动态伪装 (如果 main.py 没传，我们就用当前 m3u8 域名保底)
         if 'Referer' not in self.session.headers:
             from urllib.parse import urlparse
             domain = f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
@@ -65,56 +69,116 @@ class GenericHLSHandler:
             total = len(playlist.segments)
             log(f"📦 解析成功: 共 {total} 个切片")
             key_cache = {}
+            max_workers = min(8, total) if total > 0 else 1
+            max_retries = 3
+            backoff_seconds = 0.6
+            progress_lock = threading.Lock()
+            completed = 0
+
+            def make_session():
+                sess = requests.Session()
+                sess.headers.update(self.session.headers)
+                sess.cookies.update(self.session.cookies)
+                return sess
+
+            def fetch_key(k_uri: str) -> bytes | None:
+                k_res = self.session.get(k_uri, timeout=10)
+                if k_res.status_code != 200:
+                    return None
+                return k_res.content
+
+            segments = []
+            for idx, seg in enumerate(playlist.segments):
+                ts_url = seg.absolute_uri or urljoin(url, seg.uri)
+                key_info = None
+                if seg.key and seg.key.method == 'AES-128':
+                    k_uri = seg.key.absolute_uri or urljoin(url, seg.key.uri)
+                    if seg.key.iv:
+                        iv = bytes.fromhex(seg.key.iv.replace('0x', ''))
+                    else:
+                        seq = playlist.media_sequence + idx if playlist.media_sequence else idx
+                        iv = seq.to_bytes(16, 'big')
+                    key_info = {"uri": k_uri, "iv": iv}
+                segments.append({"index": idx, "url": ts_url, "key": key_info})
+
+            # 预拉取密钥，避免并发阶段重复请求
+            for seg in segments:
+                if not seg["key"]:
+                    continue
+                k_uri = seg["key"]["uri"]
+                if k_uri in key_cache:
+                    continue
+                key_data = fetch_key(k_uri)
+                if not key_data:
+                    log("❌ 密钥下载失败! Code: 非 200")
+                    return False
+                key_cache[k_uri] = key_data
+                log(f"🔑 成功获取密钥: {key_cache[k_uri].hex()[:16]}...")
+
+            def fetch_segment(seg_info: dict):
+                sess = make_session()
+                ts_url = seg_info["url"]
+                for attempt in range(max_retries):
+                    try:
+                        ts_res = sess.get(ts_url, timeout=15)
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            time.sleep(backoff_seconds * (attempt + 1))
+                            continue
+                        return seg_info["index"], None, f"切片请求异常: {e}"
+
+                    if ts_res.status_code == 200:
+                        data = ts_res.content
+                        if seg_info["key"]:
+                            k_uri = seg_info["key"]["uri"]
+                            key = key_cache.get(k_uri)
+                            if not key:
+                                return seg_info["index"], None, "密钥缺失"
+                            iv = seg_info["key"]["iv"]
+                            cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+                            decryptor = cipher.decryptor()
+                            data = decryptor.update(data) + decryptor.finalize()
+                        return seg_info["index"], data, None
+
+                    if ts_res.status_code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                        time.sleep(backoff_seconds * (attempt + 1))
+                        continue
+
+                    return seg_info["index"], None, f"切片失败 Code: {ts_res.status_code}"
+
+                return seg_info["index"], None, "切片失败: 重试耗尽"
+
+            results = [None] * total
+            errors = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(fetch_segment, seg) for seg in segments]
+                for future in as_completed(futures):
+                    idx, data, err = future.result()
+                    if err:
+                        errors.append((idx, err))
+                    else:
+                        results[idx] = data
+                    with progress_lock:
+                        completed += 1
+                        if completed % 10 == 0 or completed == total:
+                            log(f"🚀 处理中: {completed}/{total}")
+
+            if errors:
+                errors.sort(key=lambda x: x[0])
+                first_idx, first_err = errors[0]
+                log(f"❌ 首个失败切片: {first_idx} ({first_err})")
+                return False
+
+            if results and results[0] is not None:
+                if results[0].startswith(b'G'):
+                    log("✅ 探针结果: 解密后数据以 0x47 开头，结构正常。")
+                else:
+                    log(f"⚠️ 探针警报: 数据头为 {results[0][:4].hex()}，非标准 TS 流，播放可能黑屏。")
 
             with open(temp_ts_path, 'wb') as f:
-                for idx, seg in enumerate(playlist.segments):
-                    ts_url = seg.absolute_uri or urljoin(url, seg.uri)
-                    
-                    # --- 侦察阶段 2: 下载切片 ---
-                    ts_res = self.session.get(ts_url, timeout=15)
-                    if ts_res.status_code != 200:
-                        log(f"❌ 切片 {idx} 拿不到 (Code: {ts_res.status_code})")
-                        log(f"🔗 失败地址: {ts_url}")
-                        return False
-
-                    data = ts_res.content
-
-                    # --- 侦察阶段 3: 硬核解密审计 ---
-                    if seg.key and seg.key.method == 'AES-128':
-                        k_uri = seg.key.absolute_uri or urljoin(url, seg.key.uri)
-                        if k_uri not in key_cache:
-                            k_res = self.session.get(k_uri, timeout=10)
-                            if k_res.status_code != 200:
-                                log(f"❌ 密钥下载失败! Code: {k_res.status_code}")
-                                return False
-                            key_cache[k_uri] = k_res.content
-                            log(f"🔑 成功获取密钥: {key_cache[k_uri].hex()[:16]}...")
-
-                        key = key_cache[k_uri]
-                        # 确定 IV
-                        if seg.key.iv:
-                            iv = bytes.fromhex(seg.key.iv.replace('0x', ''))
-                        else:
-                            # 基于序列号生成 IV
-                            seq = playlist.media_sequence + idx if playlist.media_sequence else idx
-                            iv = seq.to_bytes(16, 'big')
-                        
-                        if idx == 0: log(f"🛠️ 解密参数: IV={iv.hex()}, KeyLen={len(key)}")
-
-                        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-                        decryptor = cipher.decryptor()
-                        data = decryptor.update(data) + decryptor.finalize()
-
-                    # --- 侦察阶段 4: 数据完整性探针 ---
-                    if idx == 0:
-                        if data.startswith(b'G'): # 0x47 的 ASCII 是 'G'
-                            log("✅ 探针结果: 解密后数据以 0x47 开头，结构正常。")
-                        else:
-                            log(f"⚠️ 探针警报: 数据头为 {data[:4].hex()}，非标准 TS 流，播放可能黑屏。")
-
+                for data in results:
                     f.write(data)
-                    if (idx + 1) % 10 == 0 or (idx + 1) == total:
-                        log(f"🚀 处理中: {idx+1}/{total}")
 
             # --- 侦察阶段 5: FFmpeg 封口 ---
             log("🎬 正在执行 [全量流修复] 与 [索引重构]...")

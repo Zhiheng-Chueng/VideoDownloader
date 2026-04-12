@@ -1,6 +1,7 @@
 import customtkinter as ctk
 import threading
 import os
+import time
 from core.manager import DownloadManager
 from handlers.generic_hls_handler import GenericHLSHandler
 
@@ -143,6 +144,16 @@ class App(ctk.CTk):
     def run_download(self, original_url, fid, real_url):
         try:
             is_hls = ".m3u8" in real_url or "hls" in fid.lower()
+            start_time = time.monotonic()
+            timing_logged = False
+
+            def log_with_timing(message):
+                nonlocal timing_logged
+                if not timing_logged and message.startswith("🎬 正在执行"):
+                    elapsed = time.monotonic() - start_time
+                    timing_logged = True
+                    self.log_to_ui(f"⏱️ 下载耗时: {elapsed:.2f}s")
+                self.log_to_ui(message)
             
             if is_hls:
                 hls_handler = None
@@ -177,7 +188,7 @@ class App(ctk.CTk):
                         self.log_to_ui("✅ 鉴权情报同步成功，准备强攻...")
                     
                     # 4. 移交任务
-                    self.manager.start_download(real_url, self.save_dir, fid, self.log_to_ui)
+                    self.manager.start_download(real_url, self.save_dir, fid, log_with_timing)
                 else:
                     self.log_to_ui("⚠️ 未找到 HLS 处理器，尝试回退至通用模式...")
                     self.manager.start_download(original_url, self.save_dir, fid, self.log_to_ui)

@@ -20,7 +20,7 @@ class YTDLPHandler(BaseHandler):
             # 阻塞式获取 JSON，由于我们会在主程序开子线程，所以不会卡死
             result = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                text=True, creationflags=creationflags, encoding='utf-8'
+                text=True, creationflags=creationflags, encoding='GB18030'
             )
             if result.returncode == 0:
                 return json.loads(result.stdout)
@@ -54,7 +54,7 @@ class YTDLPHandler(BaseHandler):
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, creationflags=creationflags, encoding='utf-8'
+                text=True, bufsize=1, creationflags=creationflags, encoding='GB18030'
             )
 
             for line in process.stdout:

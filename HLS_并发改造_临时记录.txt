@@ -1,0 +1,39 @@
+[临时记录 - 2026-04-12]
+
+已阅读文件：
+- core/ytdlp_handler.py
+- handlers/generic_hls_handler.py
+- core/base_handler.py
+- core/manager.py
+- main.py
+- handlers/custom_site_x.py
+
+当前实现观察：
+- HLS 核心逻辑位于 handlers/generic_hls_handler.py。
+- 现状是 for seg in playlist.segments 串行下载，串行解密，串行写入 temp ts。
+- UI 层在 main.py 会把解析到的 headers/cookies 注入 GenericHLSHandler.session。
+- manager 采用按 can_handle 命中处理器，GenericHLSHandler 优先级高于 YTDLPHandler。
+- HLS 判定路径：main.py 根据 real_url 是否含 .m3u8 或 fid 是否含 hls 来决定走 HLS handler。
+
+并发可行性初判：
+- 技术上可行，瓶颈主要在网络 IO，线程池可显著提速。
+- 难点是“并发下载 + 顺序写入 + AES-128 解密 + 稳定性控制”。
+- 建议采用“并发抓取 + 索引重排写入”模型，保证输出时序不乱。
+
+约束与假设：
+- 站点鉴权依赖 headers/cookies，必须保留现有注入逻辑。
+- 并发上限需要保守（默认 8），避免触发站点限流。
+- 对 requests.Session 的并发访问需要评估；若不稳定，改为线程内独立 Session。
+
+待确认问题：
+- 是否需要在 UI 提供并发数配置入口，或先写成常量。
+- 是否需要针对 429/5xx 增加重试次数的可配置项。
+
+实施记录：
+- 已在 GenericHLSHandler 中实现并发下载逻辑（ThreadPoolExecutor）。
+- 每个线程使用独立 Session，复制 headers/cookies，保留鉴权伪装。
+- 预拉取 AES-128 密钥，避免并发阶段重复请求。
+- 添加重试与退避（429/5xx/超时）。
+- 结果按 index 顺序写入 temp ts，保证时序。
+
+暂未实施代码改动（仅建立计划与记录）。
